@@ -112,7 +112,7 @@ Open PowerShell in this folder and run:
 .\Export-AccessGraph.ps1 -DatabasePath 'C:\path\to\YourDb.accdb' -OutDir '.\out'
 ```
 
-Or to save the graph in the the project folder
+Or to save the graph in the project folder
 
 ```powershell
 .\Export-AccessGraph.ps1 -DatabasePath 'C:\path\to\YourDb.accdb' -OutDir 'C:\path\to\DB folder\out'
