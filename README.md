@@ -98,11 +98,7 @@ Edges are color-coded and styled by their relationship type:
 
 ## Requirements
 
-Run the extractor on Windows with desktop Microsoft Access installed. The script automates Access through COM:
-
-```powershell
-New-Object -ComObject Access.Application
-```
+Run the extractor on Windows with desktop Microsoft Access installed. The script automates Access through COM.
 
 ## Typical usage
 
