@@ -1,4 +1,4 @@
-# Access DB Grapher 
+# Microsoft Access DB Grapher 
 
 This project exports a Microsoft Access database to `graph.json` and loads that JSON into an interactive HTML node graph.
 
