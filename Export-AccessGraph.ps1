@@ -239,7 +239,7 @@ function Add-Edge {
     $metaJson = ConvertTo-Json -InputObject $Meta -Depth 8 -Compress
     $edgeKey = ($From, $To, $Kind, $Label, $Arrows, $metaJson) -join '|'
     if ($script:EdgeIndex.ContainsKey($edgeKey)) {
-        return $script:EdgeIndex[$edgeKey]
+        return
     }
 
     $script:EdgeId += 1
@@ -398,6 +398,19 @@ function Get-AccessExportParse {
             $typeName = $matches[1].Trim()
             $block = [pscustomobject]@{
                 Type       = $typeName
+                Properties = @{}
+                Children   = New-Object 'System.Collections.Generic.List[object]'
+            }
+
+            $stack.Peek().Children.Add($block)
+            $stack.Push($block)
+            continue
+        }
+
+        # Anonymous Begin blocks (controls container / defaults block)
+        if ($line -match '^\s*Begin\s*$') {
+            $block = [pscustomobject]@{
+                Type       = '_anonymous'
                 Properties = @{}
                 Children   = New-Object 'System.Collections.Generic.List[object]'
             }
@@ -871,6 +884,29 @@ function Add-CodeHeuristicEdges {
         Add-SqlReferenceEdges -SqlText $sqlText -FromNodeId $sqlNode.id -RelationKind 'sql-reference' -SqlFolder $SqlFolder -KnownDataNames $KnownDataNames
     }
 
+    # VBA SourceObject assignment: Me.sfrmChild.SourceObject = "Form.frmName" or "sfrmName"
+    $soMatches = [regex]::Matches($Text, '(?im)\.SourceObject\s*=\s*"(?<name>(?:[^"]|"")+)"')
+    foreach ($match in $soMatches) {
+        $soValue = ($match.Groups['name'].Value -replace '""', '"').Trim()
+        if ([string]::IsNullOrWhiteSpace($soValue)) { continue }
+
+        $targetId = $null
+        if ($soValue -match '^(?i)(Form|Report)\.(.+)$') {
+            $targetId = Get-ObjectId -Group ($matches[1].ToLowerInvariant()) -Name $matches[2]
+        }
+        else {
+            # Bare name — try form first, then report
+            $tryForm = Get-ObjectId -Group 'form' -Name $soValue
+            $tryReport = Get-ObjectId -Group 'report' -Name $soValue
+            if ($script:NodeIndex.ContainsKey($tryForm)) { $targetId = $tryForm }
+            elseif ($script:NodeIndex.ContainsKey($tryReport)) { $targetId = $tryReport }
+        }
+
+        if ($targetId -and $script:NodeIndex.ContainsKey($targetId)) {
+            Add-Edge -From $OwnerNodeId -To $targetId -Label 'SourceObject' -Kind 'vba-sourceobject' -Arrows 'to' -Meta @{ sourceObject = $soValue }
+        }
+    }
+
     # VBA type-dependency edges: Dim/As, New, qualified member access to known modules/classes
     $seenTypeEdges = @{}
     foreach ($targetName in $script:NameTargets.Keys) {
@@ -994,6 +1030,7 @@ function Add-MacroHeuristicEdges {
 function Copy-ViewerIfPresent {
     param(
         [string]$DestinationFolder,
+        [string]$GraphJson,
         [switch]$Disabled
     )
 
@@ -1003,7 +1040,10 @@ function Copy-ViewerIfPresent {
 
     $viewerSource = Join-Path $PSScriptRoot 'access-graph-viewer.html'
     if (Test-Path -LiteralPath $viewerSource) {
-        Copy-Item -LiteralPath $viewerSource -Destination (Join-Path $DestinationFolder 'index.html') -Force
+        $html = Get-Content -LiteralPath $viewerSource -Raw
+        $embedTag = "<script>var EMBEDDED_GRAPH = $GraphJson;</script>"
+        $html = $html -replace '<!-- EMBED_GRAPH_DATA -->', $embedTag
+        Set-Content -LiteralPath (Join-Path $DestinationFolder 'index.html') -Value $html -Encoding UTF8
     }
 }
 
@@ -1035,6 +1075,7 @@ $access = $null
 $db = $null
 
 try {
+    Write-Progress -Activity 'Access Graph Export' -Status 'Opening database...' -PercentComplete 0
     Write-Host ('Opening database: ' + $databaseFullPath)
     $access = New-Object -ComObject Access.Application
     $access.Visible = $false
@@ -1042,6 +1083,8 @@ try {
     $db = $access.CurrentDb()
 
     $tableNames = New-Object 'System.Collections.Generic.List[string]'
+    Write-Progress -Activity 'Access Graph Export' -Status 'Scanning tables...' -PercentComplete 5
+    $tableIdx = 0
     foreach ($tableDef in $db.TableDefs) {
         $tdName = $null
         try { $tdName = [string]$tableDef.Name } catch { continue }
@@ -1051,6 +1094,8 @@ try {
 
         $tableName = $tdName
         $tableNames.Add($tableName)
+        $tableIdx++
+        Write-Progress -Activity 'Access Graph Export' -Status "Scanning table: $tableName" -PercentComplete 5
 
         Ensure-TableFieldSet -TableName $tableName
         $fieldSet = $script:KnownTableFields[$tableName]
@@ -1085,6 +1130,7 @@ try {
         }
     }
 
+    Write-Progress -Activity 'Access Graph Export' -Status 'Scanning relationships...' -PercentComplete 10
     foreach ($relation in $db.Relations) {
         if (-not $script:NodeIndex.ContainsKey((Get-ObjectId -Group 'table' -Name $relation.Table))) {
             continue
@@ -1105,6 +1151,7 @@ try {
     }
 
     $queryNames = New-Object 'System.Collections.Generic.List[string]'
+    $queryIdx = 0
     foreach ($queryDef in $db.QueryDefs) {
         $qdName = $null
         try { $qdName = [string]$queryDef.Name } catch { continue }
@@ -1114,6 +1161,8 @@ try {
 
         $queryName = $qdName
         $queryNames.Add($queryName)
+        $queryIdx++
+        Write-Progress -Activity 'Access Graph Export' -Status "Exporting query ($queryIdx): $queryName" -PercentComplete 15
         $rawInfo = Save-TextObject -AccessApp $access -Type $AcObjectType.Query -Name $queryName -Folder (Join-Path $rawDir 'queries')
 
         $sqlText = try { [string]$queryDef.SQL } catch { '' }
@@ -1131,9 +1180,14 @@ try {
     }
 
     $allForms = @($access.CurrentProject.AllForms)
+    $formTotal = $allForms.Count
+    $formIdx = 0
     foreach ($obj in $allForms) {
         $name = $null
         try { $name = [string]$obj.Name } catch { continue }
+        $formIdx++
+        $pct = [int](25 + (15 * $formIdx / [Math]::Max($formTotal, 1)))
+        Write-Progress -Activity 'Access Graph Export' -Status "Exporting form ($formIdx/$formTotal): $name" -PercentComplete $pct
         $rawInfo = Save-TextObject -AccessApp $access -Type $AcObjectType.Form -Name $name -Folder (Join-Path $rawDir 'forms')
         $nodeId = Get-ObjectId -Group 'form' -Name $name
         Add-Node -Id $nodeId -Label $name -Group 'form' -Meta @{
@@ -1145,9 +1199,14 @@ try {
     }
 
     $allReports = @($access.CurrentProject.AllReports)
+    $reportTotal = $allReports.Count
+    $reportIdx = 0
     foreach ($obj in $allReports) {
         $name = $null
         try { $name = [string]$obj.Name } catch { continue }
+        $reportIdx++
+        $pct = [int](40 + (10 * $reportIdx / [Math]::Max($reportTotal, 1)))
+        Write-Progress -Activity 'Access Graph Export' -Status "Exporting report ($reportIdx/$reportTotal): $name" -PercentComplete $pct
         $rawInfo = Save-TextObject -AccessApp $access -Type $AcObjectType.Report -Name $name -Folder (Join-Path $rawDir 'reports')
         $nodeId = Get-ObjectId -Group 'report' -Name $name
         Add-Node -Id $nodeId -Label $name -Group 'report' -Meta @{
@@ -1159,6 +1218,7 @@ try {
     }
 
     $allMacros = @($access.CurrentProject.AllMacros)
+    Write-Progress -Activity 'Access Graph Export' -Status 'Exporting macros...' -PercentComplete 50
     foreach ($obj in $allMacros) {
         $name = $null
         try { $name = [string]$obj.Name } catch { continue }
@@ -1173,6 +1233,7 @@ try {
     }
 
     $allModules = @($access.CurrentProject.AllModules)
+    Write-Progress -Activity 'Access Graph Export' -Status 'Exporting modules...' -PercentComplete 55
     foreach ($obj in $allModules) {
         $name = $null
         try { $name = [string]$obj.Name } catch { continue }
@@ -1188,6 +1249,7 @@ try {
 
     $knownDataNames = @($script:DataNameTargets.Keys | Sort-Object { $_.Length } -Descending)
 
+    Write-Progress -Activity 'Access Graph Export' -Status 'Analyzing query edges...' -PercentComplete 60
     foreach ($queryDef in $db.QueryDefs) {
         if ([string]::IsNullOrWhiteSpace($queryDef.Name) -or (Is-SystemOrTemporaryName -Name $queryDef.Name)) {
             continue
@@ -1208,8 +1270,12 @@ try {
         }
     }
 
+    $formEdgeIdx = 0
     foreach ($form in $allForms) {
         $name = [string]$form.Name
+        $formEdgeIdx++
+        $pct = [int](65 + (15 * $formEdgeIdx / [Math]::Max($formTotal, 1)))
+        Write-Progress -Activity 'Access Graph Export' -Status "Analyzing form edges ($formEdgeIdx/$formTotal): $name" -PercentComplete $pct
         $rawPath = $script:NodeIndex[(Get-ObjectId -Group 'form' -Name $name)].meta.rawPath
         try {
             Add-FormOrReportEdgesFromExport -ObjectGroup 'form' -ObjectName $name -RawPath $rawPath -SqlFolder (Join-Path $rawDir 'sql') -KnownDataNames $knownDataNames
@@ -1218,6 +1284,7 @@ try {
         }
     }
 
+    Write-Progress -Activity 'Access Graph Export' -Status 'Analyzing report edges...' -PercentComplete 82
     foreach ($report in $allReports) {
         $name = [string]$report.Name
         $rawPath = $script:NodeIndex[(Get-ObjectId -Group 'report' -Name $name)].meta.rawPath
@@ -1229,6 +1296,7 @@ try {
     }
 
     if (-not $DisableMacroHeuristics) {
+        Write-Progress -Activity 'Access Graph Export' -Status 'Analyzing macro edges...' -PercentComplete 87
         foreach ($macro in $allMacros) {
             $name = [string]$macro.Name
             $rawPath = $script:NodeIndex[(Get-ObjectId -Group 'macro' -Name $name)].meta.rawPath
@@ -1237,6 +1305,7 @@ try {
     }
 
     if (-not $DisableCodeHeuristics) {
+        Write-Progress -Activity 'Access Graph Export' -Status 'Analyzing module code...' -PercentComplete 90
         foreach ($module in $allModules) {
             $name = [string]$module.Name
             $rawPath = $script:NodeIndex[(Get-ObjectId -Group 'module' -Name $name)].meta.rawPath
@@ -1247,6 +1316,7 @@ try {
         }
     }
 
+    Write-Progress -Activity 'Access Graph Export' -Status 'Writing graph output...' -PercentComplete 95
     $graph = [pscustomobject][ordered]@{
         meta = [ordered]@{
             database      = $databaseFullPath
@@ -1272,10 +1342,12 @@ try {
     }
 
     $graphPath = Join-Path $OutDir 'graph.json'
-    $graph | ConvertTo-Json -Depth 25 | Set-Content -LiteralPath $graphPath -Encoding UTF8
+    $graphJson = $graph | ConvertTo-Json -Depth 25
+    Set-Content -LiteralPath $graphPath -Value $graphJson -Encoding UTF8
 
-    Copy-ViewerIfPresent -DestinationFolder $OutDir -Disabled:$SkipViewerCopy
+    Copy-ViewerIfPresent -DestinationFolder $OutDir -GraphJson $graphJson -Disabled:$SkipViewerCopy
 
+    Write-Progress -Activity 'Access Graph Export' -Completed
     Write-Host ('Graph written to: ' + $graphPath)
     Write-Host ('Nodes: {0}  Edges: {1}  Warnings: {2}' -f $script:Nodes.Count, $script:Edges.Count, $script:Warnings.Count)
 }
